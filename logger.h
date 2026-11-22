@@ -6,7 +6,6 @@
 
     #define vsnprintf stbsp_vsnprintf
 #endif
-#include "logger.h"
 #include <string.h>
 #include <android/log.h>
 
