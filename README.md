@@ -1,4 +1,4 @@
-# Improved Vehicle Mobile (v0.2, belum diuji di game)
+# Improved Vehicle Mobile (v0.3, belum diuji di game)
 
 Build (NDK r25+):
 1. Salin header AML dari repo AndroidModLoader ke `include/mod/` (amlmod.h, logger.h, dst.).
@@ -7,8 +7,9 @@ Build (NDK r25+):
 
 Verifikasi (lihat `adb logcat -s ImprovedVehicleMobile`):
 - Semua baris `Hook ...: ok`. Kalau ada "TIDAK ditemukan", versi libGTASA Anda tidak punya simbol itu.
-- `Touch type=... id=...` -> cocokkan kode DOWN/UP dengan `kTouchDown/kTouchUp` di main.cpp.
-- Jika muncul "Matrix kendaraan tidak valid" -> sesuaikan `kMatrixPtrOffset`.
+- `Touch type=... id=...` dan `Touch: kode DOWN=.. UP=.. (dipelajari otomatis)` -> kode sentuh tidak perlu diatur manual lagi.
+- Jika muncul "Matrix kendaraan tidak valid" -> sesuaikan `kMatrixPtrOffset` di `config.h`.
+- Baris `Ringkas: ...` (tiap 10 detik, 12 kali) menunjukkan apakah mobil pemain/NPC terdeteksi dan berapa cahaya sein yang ditambahkan.
 - Jika "UI butuh GLES3" -> tombol tidak digambar.
 
 ## Build otomatis di GitHub (Actions)
@@ -27,6 +28,19 @@ Verifikasi (lihat `adb logcat -s ImprovedVehicleMobile`):
 - Log juga ditulis ke file (bisa dibaca dari HP tanpa adb):
   `/storage/emulated/0/Android/data/com.rockstargames.gtasa/files/IMVEH.log`
   Cari baris: `UiInit ... siap`, `Render2dStuff berjalan`, `Kendaraan pemain terdeteksi`, `Tombol digambar pertama kali`.
+
+## Perubahan v0.3 (perbaikan)
+- **Tombol gas/kamera macet**: penyaring sentuhan ditulis ulang (`touch_filter.h`). Kode DOWN/UP dipelajari otomatis,
+  hanya sentuhan yang DIAWALI di tombol mod yang ditelan, sentuhan lain selalu diteruskan utuh, dan status tangkapan
+  tidak bisa tersangkut lagi.
+- **Sein NPC**: sebelumnya belum ada kodenya sama sekali. Sekarang NPC yang berbelok (dideteksi dari laju putar) berkedip
+  (`config.h`: `kNpcSignals`, `kNpc*`).
+- **Sein pemain**: matrix kendaraan tidak lagi mematikan sein untuk seluruh sesi hanya karena satu kali gagal baca;
+  ada cadangan lewat posisi+heading bila `m_matrix` null; cahaya diperbesar (`kSeinRadius`).
+- Bila `CVehicle::PreRender` tidak ditemukan, hook dicoba ke `CAutomobile`/`CBike`.
+- Workflow CI disatukan di `.github/workflows/build.yml` (build.yml ganda di root dihapus); `common.cpp` ikut dibangun.
+- Namespace konstanta diganti `ivm` karena bentrok dengan variabel global `cfg` milik makro `MYMODCFG`.
+- `lights.h` belum dipakai (fitur sinar lampu volumetrik / material emissive belum diimplementasikan).
 
 ## Asumsi yang perlu dicek di game
 - Layout `RwIm2DVertex` dianggap 28 byte (x,y,z,rhw,warna,u,v). Jika tampilan kacau/tidak muncul, kirim isi IMVEH.log.

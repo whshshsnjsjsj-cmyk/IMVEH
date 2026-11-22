@@ -1,7 +1,7 @@
 LOCAL_PATH := $(call my-dir)
 include $(CLEAR_VARS)
 LOCAL_MODULE    := ImprovedVehicleMobile
-LOCAL_SRC_FILES := main.cpp ui.cpp log.cpp
+LOCAL_SRC_FILES := main.cpp ui.cpp log.cpp common.cpp
 # Implementasi kelas Config milik AML (dibutuhkan oleh makro MYMODCFG)
 LOCAL_SRC_FILES += include/mod/config.cpp
 # Letakkan header AML di ./include/mod/amlmod.h (dari repo AndroidModLoader)

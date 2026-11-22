@@ -2,12 +2,14 @@
 #include <stdint.h>
 #include <stddef.h>
 // Semua nilai yang kemungkinan perlu disesuaikan ada di sini.
-namespace cfg {
+namespace ivm {
 // ---- input ----
-constexpr int kTouchDown = 1, kTouchUp = 3;               // cocokkan dengan log "Touch type=..."
+// (v0.3) Kode DOWN/UP pada AND_TouchEvent sekarang dipelajari otomatis (lihat touch_filter.h),
+// tidak perlu lagi diisi manual.
 
 // ---- tata letak objek game (arm64, TEBAKAN - verifikasi lewat log) ----
 constexpr size_t kMatrixPtrOffset = 0x18;                 // CPlaceable::m_matrix
+constexpr size_t kPlacementOffset = 0x8;                  // CPlaceable::m_placement (pos 3 float + heading), dipakai bila m_matrix == null
 constexpr size_t kClumpPtrOffset  = 0x20;                 // CEntity::m_pRwObject (RpClump*, type==2)
 constexpr size_t kRpMaterialColorOffset = 8;              // RpMaterial::color (RwRGBA)
 constexpr size_t kRpMaterialRefOffset   = 36;             // RpMaterial::refCount (int16)
@@ -19,6 +21,11 @@ constexpr bool kSwapSides = false;                        // true jika kiri/kana
 
 // ---- geometri lampu sein 3D (perkiraan, meter) ----
 constexpr float kHalfWidth = 0.90f, kHalfLength = 2.20f, kLampHeight = 0.30f;
+
+// ---- tampilan sein 3D (cahaya titik CPointLights::AddLight) ----
+constexpr float kSeinRadius = 4.0f;                       // jari-jari cahaya (m); naikkan bila kurang terlihat
+constexpr float kSeinColor[3] = {1.0f, 0.5f, 0.0f};       // oranye
+constexpr bool  kNpcSignals = true;                       // false = matikan sein NPC
 
 // ---- sein NPC (heuristik dari laju putar/yaw) ----
 constexpr float kNpcYawOn = 0.18f;     // rad/s untuk mulai berkedip
