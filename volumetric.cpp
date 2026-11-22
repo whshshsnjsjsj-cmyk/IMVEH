@@ -1,6 +1,7 @@
 // Lampu depan volumetrik: ray-march kerucut cahaya di ruang dunia terhadap depth buffer adegan, resolusi setengah,
 // lalu ditambahkan (additive) ke framebuffer. Semua state GL milik game disimpan dan dipulihkan.
 #include "volumetric.h"
+#include "common.h"
 #include "config.h"
 #include "log.h"
 #include "vmath.h"
