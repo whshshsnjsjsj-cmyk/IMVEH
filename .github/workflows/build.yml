@@ -47,6 +47,13 @@ jobs:
             -j"$(nproc)"
           ls -l "libs/arm64-v8a/$LIB_NAME"
 
+      - name: Periksa simbol yang diekspor (AML butuh OnModLoad dan __GetModInfo)
+        run: |
+          NM="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          "$NM" -D --defined-only "libs/arm64-v8a/$LIB_NAME" | tee /tmp/exports.txt
+          grep -q " OnModLoad" /tmp/exports.txt || { echo "OnModLoad TIDAK diekspor -> AML tidak akan memuat plugin"; exit 1; }
+          grep -q " __GetModInfo" /tmp/exports.txt || { echo "__GetModInfo TIDAK diekspor -> AML tidak akan memuat plugin"; exit 1; }
+
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
