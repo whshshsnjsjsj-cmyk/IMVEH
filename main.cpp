@@ -17,8 +17,12 @@
 #include "touch_filter.h"
 #include "ui.h"
 #include "log.h"
+#include "symscan.h"
+#include "coronasig.h"
+#include "volumetric.h"
+#include "emissive.h"
 
-MYMODCFG(net.local.improvedvehiclemobile, Improved Vehicle Mobile, 0.3.0, YourName)
+MYMODCFG(net.local.improvedvehiclemobile, Improved Vehicle Mobile, 0.4.0, YourName)
 
 #define LOGI(...) ImLog(__VA_ARGS__)
 
@@ -30,6 +34,15 @@ static int   (*OS_ScreenGetWidth)() = nullptr;
 static int   (*OS_ScreenGetHeight)() = nullptr;
 static AddLightFn_t AddLight = nullptr;
 
+// CCoronas::RegisterCorona - efek lampu yang benar-benar tampil. Alamat dicari saat OnModLoad (lihat resolveCorona).
+typedef void (*RegisterCoronaFn_t)(uint32_t id, void* attachTo, uint8_t r, uint8_t g, uint8_t b, uint8_t a, const Vec3* pos,
+                                   float radius, float farClip, uint8_t type, uint8_t flare, bool reflect, bool los, int unused,
+                                   float angle, bool longDist, float nearClip, uint8_t fadeState, float fadeSpeed,
+                                   bool onlyBelow, bool reflDelay);
+static RegisterCoronaFn_t RegisterCorona = nullptr;
+static bool g_coronaOk = false;
+static int  g_stCoronas = 0;
+
 static void (*PreRender_o)(void*);
 static void (*PreRenderAuto_o)(void*);
 static void (*PreRenderBike_o)(void*);
@@ -39,6 +52,15 @@ static void (*HeadBeam_o)(void*, int, void*, unsigned char);
 static unsigned char (*HeadEffect_o)(void*, int, void*, unsigned char, unsigned char);
 static void (*HeadFloorTwin_o)(void*, void*);
 static void (*HeadFloorSingle_o)(void*, void*, unsigned char);
+static void  (*ConstructRenderList_o)();
+static void  (*RenderScene_o)(bool);
+static void  (*MobileRender_o)();
+static void* (*ReadMaterial_o)(void*);
+static void* (*CloneMaterial_o)(void*);
+static int   (*DestroyMaterial_o)(void*);
+static void  (*EditMaterials_o)(void*);
+static void  (*MatProps_o)(const void*, unsigned);
+static GetMatFn GetView = nullptr, GetProj = nullptr;
 
 enum { SIG_OFF = 0, SIG_LEFT, SIG_RIGHT, SIG_HAZARD };
 static std::atomic<int>     g_mode{SIG_OFF};
@@ -116,7 +138,9 @@ static int npcDirection(void* veh, const Vec3& pos, const Vec3& fwd, int64_t now
 
 // ---------------------------- lampu sein 3D ----------------------------
 // Satu cahaya titik di tiap sudut sisi yang menyala (depan + belakang). mode: SIG_LEFT / SIG_RIGHT / SIG_HAZARD.
-static void addSeinLights(const Vec3& r, const Vec3& f, const Vec3& u, const Vec3& p, int mode, int* budget) {
+static void addSeinLights(void* veh, const Vec3& r, const Vec3& f, const Vec3& u, const Vec3& p, int mode, int* budget) {
+    // ID corona unik per kendaraan + sudut, supaya engine memperbarui corona yang sama tiap frame (bukan menumpuk).
+    uint32_t base = ivm::kCoronaIdBase + ((uint32_t)(((uintptr_t)veh >> 4) & 0x3FF) << 3);
     for (int side = -1; side <= 1; side += 2) {
         bool left = (side < 0) != ivm::kSwapSides;
         if (!(mode == SIG_HAZARD || (mode == SIG_LEFT && left) || (mode == SIG_RIGHT && !left))) continue;
@@ -124,7 +148,14 @@ static void addSeinLights(const Vec3& r, const Vec3& f, const Vec3& u, const Vec
             if (budget && *budget <= 0) return;
             float x = side * ivm::kHalfWidth, y = end * ivm::kHalfLength, z = ivm::kLampHeight;
             Vec3 w = {p.x + r.x * x + f.x * y + u.x * z, p.y + r.y * x + f.y * y + u.y * z, p.z + r.z * x + f.z * y + u.z * z};
-            AddLight(0 /*point light*/, w, Vec3{0, 0, 0}, ivm::kSeinRadius, ivm::kSeinColor[0], ivm::kSeinColor[1], ivm::kSeinColor[2], 0, false, nullptr);
+            if (g_coronaOk && ivm::kUseCoronas) {
+                uint32_t id = base + (uint32_t)((side > 0) * 2 + (end > 0));
+                RegisterCorona(id, veh, ivm::kCoronaColor[0], ivm::kCoronaColor[1], ivm::kCoronaColor[2], 255, &w,
+                               ivm::kCoronaSize, ivm::kCoronaFarClip, (uint8_t)ivm::kCoronaType, (uint8_t)ivm::kCoronaFlare,
+                               false /*reflect*/, true /*los*/, 0, 0.f, false, ivm::kCoronaNearClip, 0, ivm::kCoronaFadeSpeed, false, false);
+                ++g_stCoronas;
+            }
+            if (AddLight) AddLight(0 /*point light*/, w, Vec3{0, 0, 0}, ivm::kSeinRadius, ivm::kSeinColor[0], ivm::kSeinColor[1], ivm::kSeinColor[2], 0, false, nullptr);
             ++g_stLights;
             if (budget) --*budget;
         }
@@ -132,7 +163,10 @@ static void addSeinLights(const Vec3& r, const Vec3& f, const Vec3& u, const Vec
 }
 
 // ---------------------------- hook kendaraan ----------------------------
-static void OnVehiclePreRender(void* self) {
+static int  g_sigOut = EM_SIG_NONE;      // status sein kendaraan yang sedang diproses (untuk emissive)
+static bool g_blinkOut = false;
+
+static void OnVehiclePreRenderImpl(void* self) {
     if (!self) return;
     int64_t now = NowMs();
     bool player = isPlayerVehicle(self);
@@ -143,7 +177,7 @@ static void OnVehiclePreRender(void* self) {
     } else if (!ivm::kNpcSignals) {
         return;
     }
-    if (!AddLight || !g_cornerOk) return;
+    if (!g_cornerOk) return;
     int mode = player ? g_mode.load() : SIG_OFF;
 
     Vec3 r, f, u, p;
@@ -163,9 +197,13 @@ static void OnVehiclePreRender(void* self) {
         return;
     }
     g_matFailStreak = 0;
+    if (player) {
+        static bool logged = false;
+        if (!logged) { logged = true; LOGI("Orientasi pemain ok: pos=(%.1f %.1f %.1f) fwd=(%.2f %.2f %.2f)", p.x, p.y, p.z, f.x, f.y, f.z); }
+    }
 
     if (player) {
-        if (blinkOn(now)) addSeinLights(r, f, u, p, mode, nullptr);
+        if (blinkOn(now)) addSeinLights(self, r, f, u, p, mode, nullptr);
         return;
     }
 
@@ -173,20 +211,72 @@ static void OnVehiclePreRender(void* self) {
     ++g_stNpcSeen;
     int dir = npcDirection(self, p, f, now);
     if (dir == 0) return;
-    if (!blinkOn(now, (uint32_t)(((uintptr_t)self >> 4) * 37u))) return;   // tiap mobil beda fase kedip
+    bool nb = blinkOn(now, (uint32_t)(((uintptr_t)self >> 4) * 37u));       // tiap mobil beda fase kedip
+    g_sigOut = dir < 0 ? EM_SIG_LEFT : EM_SIG_RIGHT; g_blinkOut = nb;
+    if (!nb) return;
     if (now - g_lastPlayerVehMs < 500) {                                    // jarak ke pemain (bila ada acuan)
         float dx = p.x - g_playerPos.x, dy = p.y - g_playerPos.y, dz = p.z - g_playerPos.z;
         if (dx * dx + dy * dy + dz * dz > ivm::kNpcLightRange * ivm::kNpcLightRange) return;
     }
     ++g_stNpcBlink;
-    addSeinLights(r, f, u, p, dir < 0 ? SIG_LEFT : SIG_RIGHT, &g_npcBudget);
+    addSeinLights(self, r, f, u, p, dir < 0 ? SIG_LEFT : SIG_RIGHT, &g_npcBudget);
+}
+
+// Pembungkus: jalankan logika sein, lalu perbarui status emissive (sein + lampu depan) untuk kendaraan ini.
+static void OnVehiclePreRender(void* self) {
+    g_sigOut = EM_SIG_NONE; g_blinkOut = false;
+    if (self && isPlayerVehicle(self)) {
+        int m = g_mode.load();
+        g_sigOut = m == SIG_LEFT ? EM_SIG_LEFT : m == SIG_RIGHT ? EM_SIG_RIGHT : m == SIG_HAZARD ? EM_SIG_HAZARD : EM_SIG_NONE;
+        g_blinkOut = blinkOn(NowMs());
+    }
+    OnVehiclePreRenderImpl(self);
+    if (self) EmisVehicleState(self, g_sigOut, g_blinkOut);
 }
 
 static void PreRender_h(void* self)     { PreRender_o(self);     OnVehiclePreRender(self); }
 static void PreRenderAuto_h(void* self) { PreRenderAuto_o(self); OnVehiclePreRender(self); }
 static void PreRenderBike_h(void* self) { PreRenderBike_o(self); OnVehiclePreRender(self); }
 
-static void HeadBeam_h(void* s, int i, void* m, unsigned char b) { if (g_lightsOff && isPlayerVehicle(s)) return; HeadBeam_o(s, i, m, b); }
+// Catat sumber sinar dari matriks yang diberikan game ke DoHeadLightBeam. Bila matriks itu = matriks kendaraan (posisi ~ pusat mobil),
+// asal sinar digeser ke posisi lampu depan; bila sudah berupa matriks lampu, dipakai apa adanya.
+static void noteBeam(void* veh, int idx, const void* cm) {
+    EmisNoteHeadlight(veh);
+    float f[15];
+    if (!cm || !SafeRead(cm, f, sizeof f)) return;
+    for (float v : f) if (!isfinite(v)) return;
+    Vec3 r = {f[0], f[1], f[2]}, fw = {f[4], f[5], f[6]}, up = {f[8], f[9], f[10]}, pos = {f[12], f[13], f[14]};
+    float lf = len3(fw);
+    if (lf < 0.9f || lf > 1.1f) return;
+    fw = {fw.x / lf, fw.y / lf, fw.z / lf};
+    Vec3 vr, vf, vu, vp;
+    if (readOrientation(veh, vr, vf, vu, vp)) {
+        float dx = pos.x - vp.x, dy = pos.y - vp.y, dz = pos.z - vp.z;
+        if (dx * dx + dy * dy + dz * dz < 0.25f) {                       // matriks kendaraan -> geser ke lampu
+            float side = (idx == 0 ? -1.f : 1.f) * ivm::kHeadHalfWidth;
+            pos = {pos.x + r.x * side + fw.x * ivm::kHeadForward + up.x * ivm::kHeadHeight,
+                   pos.y + r.y * side + fw.y * ivm::kHeadForward + up.y * ivm::kHeadHeight,
+                   pos.z + r.z * side + fw.z * ivm::kHeadForward + up.z * ivm::kHeadHeight};
+        }
+    }
+    VolAddBeam(pos, fw);
+}
+
+static void HeadBeam_h(void* s, int i, void* m, unsigned char b) {
+    if (g_lightsOff && isPlayerVehicle(s)) return;
+    HeadBeam_o(s, i, m, b);
+    noteBeam(s, i, m);
+}
+
+// ---- hook frame / render / material (v0.4) ----
+static void ConstructRenderList_h() { ConstructRenderList_o(); VolFrameBegin(); EmisFrame(); }
+static void RenderScene_h(bool a)   { RenderScene_o(a); VolCacheMatrices(GetView, GetProj); }
+static void MobileRender_h()        { MobileRender_o(); VolOnPostEffects(GetView, GetProj); }
+static void* ReadMaterial_h(void* stream) { void* m = ReadMaterial_o(stream); if (m) EmisMaterialRead(m); return m; }
+static void* CloneMaterial_h(void* src)   { void* m = CloneMaterial_o(src); if (m) EmisMaterialClone(src, m); return m; }
+static int   DestroyMaterial_h(void* m)   { EmisMaterialDestroy(m); return DestroyMaterial_o(m); }
+static void  EditMaterials_h(void* clump) { EmisSetCurrentClump(clump); EditMaterials_o(clump); }
+static void  MatProps_h(const void* m, unsigned f) { MatProps_o(m, f); EmisAfterMaterialProps(m); }
 static unsigned char HeadEffect_h(void* s, int i, void* m, unsigned char a, unsigned char b) { if (g_lightsOff && isPlayerVehicle(s)) return 0; return HeadEffect_o(s, i, m, a, b); }
 static void HeadFloorTwin_h(void* s, void* m) { if (g_lightsOff && isPlayerVehicle(s)) return; HeadFloorTwin_o(s, m); }
 static void HeadFloorSingle_h(void* s, void* m, unsigned char b) { if (g_lightsOff && isPlayerVehicle(s)) return; HeadFloorSingle_o(s, m, b); }
@@ -207,8 +297,11 @@ static void Render2d_h() {
     if (statLines < 12 && now >= nextStat) {
         if (nextStat != 0) {
             ++statLines;
-            LOGI("Ringkas: frameMobilPemain=%d npcDilihat=%d npcBerkedip=%d cahayaDitambah=%d gagalBacaMatrix=%d mode=%d AddLight=%s",
-                 g_stPlayerFrames, g_stNpcSeen, g_stNpcBlink, g_stLights, g_stMatrixFail, g_mode.load(), AddLight ? "ada" : "TIDAK ADA");
+            LOGI("Ringkas: frameMobilPemain=%d npcDilihat=%d npcBerkedip=%d cahayaDitambah=%d gagalBacaMatrix=%d mode=%d AddLight=%s corona=%d(%s)",
+                 g_stPlayerFrames, g_stNpcSeen, g_stNpcBlink, g_stLights, g_stMatrixFail, g_mode.load(), AddLight ? "ada" : "TIDAK ADA",
+                 g_stCoronas, g_coronaOk ? "aktif" : "TIDAK AKTIF");
+            VolLogStats();
+            EmisLogStats();
         }
         nextStat = now + 10000;
     }
@@ -254,6 +347,32 @@ template <class F> static bool hookSym(const char* sym, F ours, F& orig) {
     return true;
 }
 
+// Cari CCoronas::RegisterCorona. Coba nama yang diharapkan; bila tidak ada, pindai tabel simbol libGTASA.so
+// dan hanya pakai kandidat yang signature-nya cocok (lihat coronasig.h). Semua kandidat dicatat di IMVEH.log.
+static void resolveCorona() {
+    static const char* kExpected = "_ZN8CCoronas14RegisterCoronaEjP7CEntityhhhhRK7CVectorffhhbbifbfhfbb";
+    static char cand[12][256];
+    int n = FindSymbolsByPrefix("libGTASA.so", "_ZN8CCoronas", cand, 12);
+    LOGI("Simbol CCoronas ditemukan: %d", n);
+    for (int i = 0; i < n; ++i) LOGI("  CCoronas[%d]: %s", i, cand[i]);
+
+    void* addr = reinterpret_cast<void*>(aml->GetSym(g_gta, kExpected));
+    const char* used = addr ? kExpected : nullptr;
+    for (int i = 0; i < n && !addr; ++i) {
+        if (!CoronaSigMatches(cand[i])) continue;
+        addr = reinterpret_cast<void*>(aml->GetSym(g_gta, cand[i]));
+        if (addr) used = cand[i];
+    }
+    if (addr) {
+        RegisterCorona = (RegisterCoronaFn_t)addr;
+        g_coronaOk = true;
+        LOGI("RegisterCorona: ok (%s) -> %p", used, addr);
+    } else {
+        LOGI("RegisterCorona: TIDAK ditemukan / signature tidak cocok. Sein hanya cahaya titik (hampir tak terlihat). "
+             "Kirim baris 'CCoronas[...]' di atas agar signature bisa disesuaikan.");
+    }
+}
+
 extern "C" __attribute__((visibility("default"))) void OnModLoad() {
     g_gta = aml->GetLibHandle("libGTASA.so");
     if (!g_gta) { LOGI("libGTASA.so tidak ditemukan"); return; }
@@ -262,6 +381,11 @@ extern "C" __attribute__((visibility("default"))) void OnModLoad() {
     OS_ScreenGetWidth  = (int (*)())aml->GetSym(g_gta, "_Z17OS_ScreenGetWidthv");
     OS_ScreenGetHeight = (int (*)())aml->GetSym(g_gta, "_Z18OS_ScreenGetHeightv");
     AddLight = (AddLightFn_t)aml->GetSym(g_gta, "_ZN12CPointLights8AddLightEh7CVectorS0_ffffhbP7CEntity");
+    resolveCorona();
+    GetView = (GetMatFn)aml->GetSym(g_gta, "_Z20GetCurrentViewMatrixv");
+    GetProj = (GetMatFn)aml->GetSym(g_gta, "_Z26GetCurrentProjectionMatrixv");
+    LOGI("GetCurrentViewMatrix=%p GetCurrentProjectionMatrix=%p", (void*)GetView, (void*)GetProj);
+    EmisInit((EmuMaterialfvFn)aml->GetSym(g_gta, "_Z16emu_glMaterialfvjjPKf"));
     LOGI("FindPlayerVehicle=%p ScreenW=%p ScreenH=%p AddLight=%p", (void*)FindPlayerVehicle, (void*)OS_ScreenGetWidth, (void*)OS_ScreenGetHeight, (void*)AddLight);
 
     // Sein 3D butuh PreRender. Bila CVehicle::PreRender tidak ada, coba subkelas (mobil & motor).
@@ -280,8 +404,16 @@ extern "C" __attribute__((visibility("default"))) void OnModLoad() {
     }
     hookSym("_Z14AND_TouchEventiiii", Touch_h, Touch_o);
     hookSym("_ZN8CVehicle15DoHeadLightBeamEiR7CMatrixh", HeadBeam_h, HeadBeam_o);
+    hookSym("_ZN9CRenderer19ConstructRenderListEv", ConstructRenderList_h, ConstructRenderList_o);
+    hookSym("_Z11RenderSceneb", RenderScene_h, RenderScene_o);
+    hookSym("_ZN12CPostEffects12MobileRenderEv", MobileRender_h, MobileRender_o);
+    hookSym("_Z20RpMaterialStreamReadP8RwStream", ReadMaterial_h, ReadMaterial_o);
+    hookSym("_Z15RpMaterialCloneP10RpMaterial", CloneMaterial_h, CloneMaterial_o);
+    hookSym("_Z17RpMaterialDestroyP10RpMaterial", DestroyMaterial_h, DestroyMaterial_o);
+    hookSym("_ZN17CVehicleModelInfo20SetEditableMaterialsEP7RpClump", EditMaterials_h, EditMaterials_o);
+    hookSym("_Z36_rwOpenGLLightsSetMaterialPropertiesPK10RpMaterialj", MatProps_h, MatProps_o);
     hookSym("_ZN8CVehicle17DoHeadLightEffectEiR7CMatrixhh", HeadEffect_h, HeadEffect_o);
     hookSym("_ZN8CVehicle25DoHeadLightReflectionTwinER7CMatrix", HeadFloorTwin_h, HeadFloorTwin_o);
     hookSym("_ZN8CVehicle27DoHeadLightReflectionSingleER7CMatrixh", HeadFloorSingle_h, HeadFloorSingle_o);
-    LOGI("Improved Vehicle Mobile 0.3.0 dimuat");
+    LOGI("Improved Vehicle Mobile 0.4.0 dimuat");
 }
