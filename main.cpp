@@ -163,7 +163,7 @@ template <class F> static bool hookSym(const char* sym, F ours, F& orig) {
     return true;
 }
 
-extern "C" void OnModLoad() {
+extern "C" __attribute__((visibility("default"))) void OnModLoad() {
     g_gta = aml->GetLibHandle("libGTASA.so");
     if (!g_gta) { LOGI("libGTASA.so tidak ditemukan"); return; }
 
