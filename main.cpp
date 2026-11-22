@@ -1,6 +1,8 @@
 // Improved Vehicle Mobile - plugin AML untuk GTA SA Android arm64.
 // Fitur v0.1: sein kiri/kanan/hazard (lampu sein berkedip), tombol lampu depan on/off,
 // tombol modern bergaya rounded + glow. Semua hook memakai NAMA SIMBOL (tanpa offset hardcode).
+#include <mod/logger.h>
+#include <mod/config.h>
 #include <mod/amlmod.h>
 #include <android/log.h>
 #include <EGL/egl.h>
@@ -150,7 +152,7 @@ static void Touch_h(int type, int id, int x, int y) {
 
 // ---------------------------- pemasangan hook ----------------------------
 template <class F> static bool hookSym(const char* sym, F ours, F& orig) {
-    void* addr = aml->GetSym(g_gta, sym);
+    void* addr = reinterpret_cast<void*>(aml->GetSym(g_gta, sym));
     if (!addr) { LOGI("Hook %s: simbol TIDAK ditemukan", sym); return false; }
     aml->Hook(addr, reinterpret_cast<void*>(ours), reinterpret_cast<void**>(&orig));
     LOGI("Hook %s: ok", sym);
