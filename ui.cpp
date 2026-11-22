@@ -1,154 +1,235 @@
 #include "ui.h"
-#include <GLES3/gl3.h>
-#include <android/log.h>
+#include "log.h"
 #include <algorithm>
 #include <atomic>
-#include <string.h>
+#include <math.h>
+#include <stdint.h>
 #include <time.h>
 
-#define TAG "ImprovedVehicleMobile"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGI(...) ImLog(__VA_ARGS__)
 
-static const char* kVS = R"GLSL(#version 300 es
-precision highp float;
-uniform vec2 uRes;
-uniform vec4 uRect;   // cx, cy, half, scale
-out vec2 vLocal;
-void main(){
-    vec2 c = vec2(float(gl_VertexID & 1) * 2.0 - 1.0, float(gl_VertexID >> 1) * 2.0 - 1.0);
-    float ext = uRect.z * uRect.w * 1.9;           // ruang ekstra untuk glow
-    vLocal = c * ext;
-    vec2 px = uRect.xy + vLocal;
-    gl_Position = vec4(px.x / uRes.x * 2.0 - 1.0, 1.0 - px.y / uRes.y * 2.0, 0.0, 1.0);
+// ========================= ASUMSI YANG PERLU DIVERIFIKASI =========================
+// Tata letak vertex Im2D (RwIm2DVertex) dianggap standar RenderWare: 28 byte.
+// Jika warna merah/biru tertukar, ubah kColorAbgr menjadi true.
+static constexpr bool kColorAbgr = false;
+// ==================================================================================
+
+namespace {
+
+struct Vtx { float x, y, z, rhw; uint32_t col; float u, v; };
+static_assert(sizeof(Vtx) == 28, "layout vertex Im2D harus 28 byte");
+
+// Enum RenderWare standar.
+enum { rsTEXRASTER = 1, rsZTEST = 6, rsSHADE = 7, rsZWRITE = 8, rsSRCBLEND = 10, rsDESTBLEND = 11, rsVALPHA = 12 };
+enum { blSRCALPHA = 5, blINVSRCALPHA = 6, shadeGOURAUD = 2, primTRILIST = 3 };
+const int kRsCount = 7;
+const int kRsIds[kRsCount] = {rsTEXRASTER, rsZTEST, rsSHADE, rsZWRITE, rsSRCBLEND, rsDESTBLEND, rsVALPHA};
+
+struct C { float r, g, b, a; };
+
+UiGfx g_gfx{};
+bool  g_ready = false;
+float g_z = 0.f, g_alphaMul = 1.f;
+const int kBuf = 576;                    // kelipatan 3
+Vtx   g_buf[kBuf];
+int   g_n = 0;
+
+inline float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
+inline C mix(C a, C b, float t) { return {a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t}; }
+inline C withA(C c, float a) { c.a = a; return c; }
+inline float easeOutBack(float t) { const float c1 = 1.70158f, c3 = c1 + 1.f; t -= 1.f; return 1.f + c3 * t * t * t + c1 * t * t; }
+
+uint32_t pack(C c) {
+    auto q = [](float v) { int i = (int)(v * 255.f + .5f); return (uint32_t)(i < 0 ? 0 : (i > 255 ? 255 : i)); };
+    uint32_t r = q(c.r), g = q(c.g), b = q(c.b), a = q(c.a * g_alphaMul);
+    return kColorAbgr ? ((a << 24) | (b << 16) | (g << 8) | r) : ((a << 24) | (r << 16) | (g << 8) | b);
 }
-)GLSL";
 
-static const char* kFS = R"GLSL(#version 300 es
-precision highp float;
-in vec2 vLocal;
-uniform vec4 uRect;
-uniform vec3 uAccent;
-uniform float uActive, uPulse, uPress;
-uniform int uIcon;
-out vec4 o;
+void flush() { if (g_n >= 3) g_gfx.renderPrimitive(primTRILIST, g_buf, g_n - g_n % 3); g_n = 0; }
+Vtx  V(float x, float y, C c) { return Vtx{x, y, g_z, 1.f, pack(c), 0.f, 0.f}; }
+void tri(Vtx a, Vtx b, Vtx c) { if (g_n + 3 > kBuf) flush(); g_buf[g_n++] = a; g_buf[g_n++] = b; g_buf[g_n++] = c; }
+void quad(Vtx a, Vtx b, Vtx c, Vtx d) { tri(a, b, c); tri(a, c, d); }
 
-float sdRound(vec2 p, float b, float r){ vec2 q = abs(p) - vec2(b - r); return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r; }
-float seg(vec2 p, vec2 a, vec2 b){ vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0); return length(pa - ba * h); }
-vec4 over(vec4 t, vec4 b){ float a = t.a + b.a * (1.0 - t.a); vec3 c = (t.rgb * t.a + b.rgb * b.a * (1.0 - t.a)) / max(a, 1e-4); return vec4(c, a); }
+// ---------- bentuk dasar ----------
+const int kSeg = 6, kPer = 4 * (kSeg + 1);
+struct Pt { float x, y; };
 
-float iconDist(vec2 q){
-    float t = 0.085;
-    if (uIcon == 0 || uIcon == 1){                // panah kiri / kanan
-        if (uIcon == 1) q.x = -q.x;
-        float d = seg(q, vec2(0.16, 0.36), vec2(-0.24, 0.0));
-        d = min(d, seg(q, vec2(-0.24, 0.0), vec2(0.16, -0.36)));
-        d = min(d, seg(q, vec2(-0.24, 0.0), vec2(0.42, 0.0)));
-        return d - t;
+void perim(float cx, float cy, float hw, float hh, float r, float grow, Pt* o) {
+    hw += grow; hh += grow; r += grow;
+    r = std::max(0.f, std::min(r, std::min(hw, hh)));
+    const float ccx[4] = {cx + hw - r, cx - hw + r, cx - hw + r, cx + hw - r};
+    const float ccy[4] = {cy + hh - r, cy + hh - r, cy - hh + r, cy - hh + r};
+    int n = 0;
+    for (int k = 0; k < 4; ++k)
+        for (int s = 0; s <= kSeg; ++s) {
+            float a = (k * 90.f + s * (90.f / kSeg)) * 0.0174532925f;
+            o[n++] = {ccx[k] + cosf(a) * r, ccy[k] + sinf(a) * r};
+        }
+}
+
+void fillRound(float cx, float cy, float hw, float hh, float r, C top, C bot) {
+    Pt p[kPer]; perim(cx, cy, hw, hh, r, 0.f, p);
+    float y0 = cy - hh, h = std::max(1.f, 2.f * hh);
+    Vtx c = V(cx, cy, mix(top, bot, .5f));
+    for (int i = 0; i < kPer; ++i) {
+        int j = (i + 1) % kPer;
+        tri(c, V(p[i].x, p[i].y, mix(top, bot, clamp01((p[i].y - y0) / h))), V(p[j].x, p[j].y, mix(top, bot, clamp01((p[j].y - y0) / h))));
     }
-    if (uIcon == 2){                               // hazard: segitiga + tanda seru
-        vec2 a = vec2(0.0, 0.44), b = vec2(-0.44, -0.30), c = vec2(0.44, -0.30);
-        float d = min(seg(q, a, b), min(seg(q, b, c), seg(q, c, a))) - 0.055;
-        d = min(d, seg(q, vec2(0.0, 0.14), vec2(0.0, -0.02)) - 0.05);
-        d = min(d, length(q - vec2(0.0, -0.15)) - 0.06);
-        return d;
+}
+
+void ringRound(float cx, float cy, float hw, float hh, float r, float g0, float g1, C c0, C c1) {
+    Pt a[kPer], b[kPer]; perim(cx, cy, hw, hh, r, g0, a); perim(cx, cy, hw, hh, r, g1, b);
+    for (int i = 0; i < kPer; ++i) {
+        int j = (i + 1) % kPer;
+        quad(V(a[i].x, a[i].y, c0), V(b[i].x, b[i].y, c1), V(b[j].x, b[j].y, c1), V(a[j].x, a[j].y, c0));
     }
-    float d = length(q - vec2(-0.16, 0.0)) - 0.24; // lampu depan + berkas cahaya
-    d = min(d, seg(q, vec2(0.18, 0.20), vec2(0.46, 0.27)) - 0.04);
-    d = min(d, seg(q, vec2(0.18, 0.00), vec2(0.48, 0.00)) - 0.04);
-    d = min(d, seg(q, vec2(0.18, -0.20), vec2(0.46, -0.27)) - 0.04);
-    return d;
 }
 
-void main(){
-    float R = uRect.z * uRect.w;
-    vec2 p = vLocal;
-    float d = sdRound(p, R, R * 0.40);
-    float aa = 1.25;
-    float glowAmt = uActive * (0.35 + 0.65 * uPulse);
-
-    vec4 col = vec4(uAccent, glowAmt * 0.60 * exp(-max(d, 0.0) / (R * 0.30)) * step(0.0, d));
-
-    vec3 base = mix(vec3(0.055, 0.065, 0.085), uAccent * 0.40, uActive * 0.85);
-    base += 0.07 * clamp(-p.y / R, -1.0, 1.0);      // gradasi halus atas -> bawah
-    base *= 1.0 - 0.18 * uPress;
-    float bodyA = (1.0 - smoothstep(-aa, aa, d)) * mix(0.66, 0.90, uActive);
-    col = over(vec4(base, bodyA), col);
-
-    float ring = 1.0 - smoothstep(0.0, aa * 1.2, abs(d + 1.2));
-    vec3 ringCol = mix(vec3(1.0), uAccent, uActive);
-    col = over(vec4(ringCol, ring * mix(0.20, 0.85, uActive)), col);
-
-    vec2 q = vec2(p.x, -p.y) / (R * 0.92);
-    float di = iconDist(q) * R * 0.92;
-    float iconA = 1.0 - smoothstep(-aa, aa, di);
-    vec3 iconCol = mix(vec3(0.84, 0.87, 0.92), mix(uAccent, vec3(1.0), 0.55), uActive * (0.45 + 0.55 * uPulse));
-    col = over(vec4(iconCol, iconA), col);
-
-    o = col;
+void disc(float cx, float cy, float r, C c) {
+    const int N = 12;
+    for (int i = 0; i < N; ++i) {
+        float a0 = i * 6.2831853f / N, a1 = (i + 1) * 6.2831853f / N;
+        tri(V(cx, cy, c), V(cx + cosf(a0) * r, cy + sinf(a0) * r, c), V(cx + cosf(a1) * r, cy + sinf(a1) * r, c));
+    }
 }
-)GLSL";
 
-static GLuint g_prog = 0, g_vao = 0;
-static bool g_failed = false;
-static GLint uRes, uRect, uAccent, uActive, uPulse, uPress, uIcon;
-static float g_act[BTN_COUNT], g_prs[BTN_COUNT], g_pulse = 0.f;
-static std::atomic<bool> g_down[BTN_COUNT];
-static double g_last = 0.0;
+// Garis dengan tepi halus (feather) + ujung membulat.
+void line(float x0, float y0, float x1, float y1, float w, C c) {
+    float dx = x1 - x0, dy = y1 - y0, len = sqrtf(dx * dx + dy * dy);
+    if (len < 1e-3f) return;
+    float nx = -dy / len, ny = dx / len, h = w * .5f, f = 1.5f; C t = withA(c, 0.f);
+    quad(V(x0 + nx * h, y0 + ny * h, c), V(x1 + nx * h, y1 + ny * h, c), V(x1 - nx * h, y1 - ny * h, c), V(x0 - nx * h, y0 - ny * h, c));
+    quad(V(x0 + nx * h, y0 + ny * h, c), V(x1 + nx * h, y1 + ny * h, c), V(x1 + nx * (h + f), y1 + ny * (h + f), t), V(x0 + nx * (h + f), y0 + ny * (h + f), t));
+    quad(V(x0 - nx * h, y0 - ny * h, c), V(x1 - nx * h, y1 - ny * h, c), V(x1 - nx * (h + f), y1 - ny * (h + f), t), V(x0 - nx * (h + f), y0 - ny * (h + f), t));
+    disc(x0, y0, h, c); disc(x1, y1, h, c);
+}
+
+// ---------- animasi ----------
+struct Spring {
+    float x = 1.f, v = 0.f;
+    void step(float target, float dt) { const float k = 380.f, c = 22.f; v += (k * (target - x) - c * v) * dt; x += v * dt; }
+};
+
+float g_act[BTN_COUNT], g_beam = 1.f, g_pulse = 0.f, g_appear = 0.f, g_rip[BTN_COUNT] = {-1, -1, -1, -1};
+Spring g_scale[BTN_COUNT];
+std::atomic<bool> g_down[BTN_COUNT], g_ripReq[BTN_COUNT];
+std::atomic<bool> g_shown{false};
+double g_last = 0.0;
+bool g_firstDraw = true;
+
+const C kAcc[BTN_COUNT] = {{1.f, .62f, .05f, 1.f}, {1.f, .30f, .12f, 1.f}, {1.f, .62f, .05f, 1.f}, {.45f, .78f, 1.f, 1.f}};
+const C kDim = {.62f, .66f, .72f, 1.f};
+
+double nowSec() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 struct Layout { float cx[BTN_COUNT]; float cy, half; };
-
-static Layout makeLayout(int W, int H) {
+Layout makeLayout(int W, int H) {
     Layout L;
-    float S = std::min(W, H) * 0.105f;
-    float gap = S * 0.26f, extra = S * 0.45f;
+    float S = std::min(W, H) * 0.105f, gap = S * 0.26f, extra = S * 0.45f;
     float x[BTN_COUNT] = {0.f, S + gap, 2 * (S + gap), 3 * (S + gap) + extra};
-    float total = x[BTN_LIGHTS] + S;
-    float start = (W - total) * 0.5f;
+    float total = x[BTN_LIGHTS] + S, start = (W - total) * 0.5f;
     L.half = S * 0.5f;
     for (int i = 0; i < BTN_COUNT; ++i) L.cx[i] = start + x[i] + L.half;
     L.cy = H - L.half - H * 0.045f;
     return L;
 }
 
-static GLuint compile(GLenum type, const char* src) {
-    GLuint s = glCreateShader(type);
-    glShaderSource(s, 1, &src, nullptr);
-    glCompileShader(s);
-    GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) { char log[512]; glGetShaderInfoLog(s, sizeof log, nullptr, log); LOGI("UI shader error: %s", log); glDeleteShader(s); return 0; }
-    return s;
+// ---------- ikon ----------
+void chevron(float x, float y, float sz, float dir, float w, C c) {
+    float tipX = x + dir * sz * .45f, backX = x - dir * sz * .45f;
+    line(backX, y - sz, tipX, y, w, c);
+    line(backX, y + sz, tipX, y, w, c);
 }
 
-static bool ensureInit() {
-    if (g_prog) return true;
-    if (g_failed) return false;
-    const char* ver = (const char*)glGetString(GL_VERSION);
-    if (!ver || !strstr(ver, "OpenGL ES 3")) { LOGI("UI butuh GLES3, versi: %s", ver ? ver : "?"); g_failed = true; return false; }
-    GLuint vs = compile(GL_VERTEX_SHADER, kVS), fs = compile(GL_FRAGMENT_SHADER, kFS);
-    if (!vs || !fs) { g_failed = true; return false; }
-    g_prog = glCreateProgram();
-    glAttachShader(g_prog, vs); glAttachShader(g_prog, fs);
-    glLinkProgram(g_prog);
-    glDeleteShader(vs); glDeleteShader(fs);
-    GLint ok = 0; glGetProgramiv(g_prog, GL_LINK_STATUS, &ok);
-    if (!ok) { char log[512]; glGetProgramInfoLog(g_prog, sizeof log, nullptr, log); LOGI("UI link error: %s", log); g_prog = 0; g_failed = true; return false; }
-    uRes = glGetUniformLocation(g_prog, "uRes");     uRect = glGetUniformLocation(g_prog, "uRect");
-    uAccent = glGetUniformLocation(g_prog, "uAccent"); uActive = glGetUniformLocation(g_prog, "uActive");
-    uPulse = glGetUniformLocation(g_prog, "uPulse"); uPress = glGetUniformLocation(g_prog, "uPress");
-    uIcon = glGetUniformLocation(g_prog, "uIcon");
-    glGenVertexArrays(1, &g_vao);   // VAO sendiri tanpa atribut, agar tidak terganggu state engine
-    LOGI("UI siap (GL %s)", ver);
-    return true;
+void iconArrows(int id, float cx, float cy, float hw, float act, float t) {
+    float dir = id == BTN_LEFT ? -1.f : 1.f;
+    float phase = fmodf((float)t / 0.7f, 1.f);
+    C bright = mix(kAcc[id], C{1, 1, 1, 1}, .35f);
+    for (int k = 0; k < 3; ++k) {                   // k=0 paling belakang, k=2 paling depan
+        float pk = (k + .5f) / 3.f, bump = clamp01(1.f - fabsf(phase - pk) * 3.f);
+        float amt = act * (.35f + .65f * bump);
+        chevron(cx + dir * (k - 1) * hw * .36f, cy, hw * .38f, dir, hw * .11f, mix(kDim, bright, amt));
+    }
 }
 
-static double nowSec() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+void iconHazard(float cx, float cy, float hw, float act, float pulse) {
+    float R = hw * .50f * (1.f + .06f * act * pulse);
+    C c = mix(kDim, mix(kAcc[BTN_HAZARD], C{1, 1, 1, 1}, .30f), act * (.40f + .60f * pulse));
+    float w = hw * .10f;
+    Pt t = {cx, cy - R}, l = {cx - R * .87f, cy + R * .5f}, r = {cx + R * .87f, cy + R * .5f};
+    line(t.x, t.y, l.x, l.y, w, c); line(l.x, l.y, r.x, r.y, w, c); line(r.x, r.y, t.x, t.y, w, c);
+    line(cx, cy - R * .25f, cx, cy + R * .08f, w, c);
+    disc(cx, cy + R * .30f, hw * .06f, c);
+}
 
-void UiSetPressed(int id, bool pressed) { if (id >= 0 && id < BTN_COUNT) g_down[id] = pressed; }
+void iconLights(float cx, float cy, float hw, float act, float beam) {
+    C c = mix(kDim, mix(kAcc[BTN_LIGHTS], C{1, 1, 1, 1}, .35f), act);
+    disc(cx - hw * .20f, cy, hw * .24f, c);
+    float bx = cx + hw * .12f, len = hw * (.14f + .26f * beam), w = hw * .09f;
+    for (int i = -1; i <= 1; ++i) line(bx, cy + i * hw * .22f, bx + len, cy + i * hw * (.22f + .12f * beam), w, c);
+    if (act < .98f) line(cx - hw * .42f, cy - hw * .36f, cx + hw * .42f, cy + hw * .36f, hw * .09f, C{1.f, .42f, .36f, 1.f - act});
+}
+
+// ---------- satu tombol ----------
+void drawButton(int id, float cx, float cy, float half, float sc, float act, float pulse, float t, float rip) {
+    C acc = kAcc[id];
+    float hw = half * sc, r = hw * .46f;
+    float breathe = act * (.45f + .55f * pulse) * (id == BTN_LIGHTS ? .6f : 1.f);
+    float press = clamp01((1.f - sc) / .10f);
+
+    // bayangan lembut
+    ringRound(cx, cy + half * .10f, hw, hw, r, 0.f, half * .30f, C{0, 0, 0, .30f}, C{0, 0, 0, 0});
+    // cahaya (glow) berdenyut
+    if (breathe > .01f)
+        for (int j = 0; j < 4; ++j) {
+            float a0 = breathe * .42f * powf(1.f - j / 4.f, 2.f), a1 = breathe * .42f * powf(1.f - (j + 1) / 4.f, 2.f);
+            ringRound(cx, cy, hw, hw, r, j * half * .16f, (j + 1) * half * .16f, withA(acc, a0), withA(acc, a1));
+        }
+    // badan kaca gelap, diwarnai aksen saat aktif
+    C top = mix(C{.14f, .16f, .21f, .80f}, C{acc.r * .62f, acc.g * .62f, acc.b * .62f, .92f}, act * .85f);
+    C bot = mix(C{.04f, .05f, .07f, .88f}, C{acc.r * .28f, acc.g * .28f, acc.b * .28f, .92f}, act * .85f);
+    float dk = 1.f - .22f * press;
+    top = {top.r * dk, top.g * dk, top.b * dk, top.a}; bot = {bot.r * dk, bot.g * dk, bot.b * dk, bot.a};
+    fillRound(cx, cy, hw, hw, r, top, bot);
+    // kilau kaca di bagian atas
+    fillRound(cx, cy - hw * .42f, hw * .80f, hw * .46f, r * .8f, C{1, 1, 1, .13f}, C{1, 1, 1, 0});
+    // bingkai tipis
+    C rim = mix(C{1, 1, 1, .22f}, withA(mix(acc, C{1, 1, 1, 1}, .25f), .95f), act);
+    ringRound(cx, cy, hw, hw, r, -1.8f, 0.f, rim, rim);
+    ringRound(cx, cy, hw, hw, r, 0.f, 1.5f, rim, withA(rim, 0.f));
+    // ikon
+    if (id == BTN_LEFT || id == BTN_RIGHT) iconArrows(id, cx, cy, hw, act, t);
+    else if (id == BTN_HAZARD) iconHazard(cx, cy, hw, act, pulse);
+    else iconLights(cx, cy, hw, act, g_beam);
+    // riak saat disentuh
+    if (rip >= 0.f) {
+        float e = 1.f - (1.f - rip) * (1.f - rip), rr = half * (.55f + 1.05f * e);
+        ringRound(cx, cy, rr, rr, rr, -2.f, 2.f, withA(acc, (1.f - rip) * .55f), withA(acc, (1.f - rip) * .55f));
+    }
+}
+
+}  // namespace
+
+bool UiInit(const UiGfx& gfx) {
+    g_gfx = gfx;
+    g_ready = gfx.renderPrimitive != nullptr;
+    LOGI("UiInit: renderPrimitive=%p rsSet=%p rsGet=%p nearZ=%p -> %s", (void*)gfx.renderPrimitive, (void*)gfx.rsSet, (void*)gfx.rsGet,
+         (void*)gfx.nearScreenZ, g_ready ? "siap" : "TIDAK bisa menggambar");
+    return g_ready;
+}
+
+bool UiShown() { return g_shown.load(); }
+
+void UiSetPressed(int id, bool pressed) {
+    if (id < 0 || id >= BTN_COUNT) return;
+    g_down[id] = pressed;
+    if (pressed) g_ripReq[id] = true;
+}
 
 int UiHitTest(int x, int y, int W, int H) {
     if (W <= 0 || H <= 0) return -1;
     Layout L = makeLayout(W, H);
-    float r = L.half * 1.2f;                     // area sentuh sedikit lebih besar dari tampilan
+    float r = L.half * 1.2f;                      // area sentuh sedikit lebih besar dari tampilan
     for (int i = 0; i < BTN_COUNT; ++i) {
         float dx = x - L.cx[i], dy = y - L.cy;
         if (dx * dx + dy * dy <= r * r) return i;
@@ -156,61 +237,49 @@ int UiHitTest(int x, int y, int W, int H) {
     return -1;
 }
 
-void UiDraw(int W, int H, const bool active[BTN_COUNT], bool blinkOn) {
-    if (W <= 0 || H <= 0 || !ensureInit()) return;
+void UiDraw(int W, int H, const bool active[BTN_COUNT], bool visible) {
+    if (!g_ready || W <= 0 || H <= 0) return;
+    double now = nowSec();
+    float dt = g_last > 0 ? (float)std::min(now - g_last, 0.03) : 0.016f;
+    g_last = now;
 
-    double t = nowSec(), dt = g_last > 0 ? std::min(t - g_last, 0.1) : 0.016; g_last = t;
-    float k = (float)std::min(1.0, dt * 14.0);
-    g_pulse += ((blinkOn ? 1.f : 0.f) - g_pulse) * std::min(1.f, (float)dt * 18.f);
+    // muncul / hilang (bertahap, tiap tombol sedikit tertunda)
+    g_appear = clamp01(g_appear + (visible ? dt / 0.55f : -dt / 0.30f));
+    g_shown = g_appear > 0.6f;
+    if (g_appear <= 0.001f) return;
+
+    bool blink = fmodf((float)now, 0.7f) < 0.35f;                  // selaras dengan blinkOn di main (700 ms)
+    g_pulse += ((blink ? 1.f : 0.f) - g_pulse) * std::min(1.f, dt * 16.f);
+    float kAct = std::min(1.f, dt * 12.f);
+    g_beam += ((active[BTN_LIGHTS] ? 1.f : 0.f) - g_beam) * std::min(1.f, dt * 8.f);
     for (int i = 0; i < BTN_COUNT; ++i) {
-        g_act[i] += ((active[i] ? 1.f : 0.f) - g_act[i]) * k;
-        g_prs[i] += ((g_down[i] ? 1.f : 0.f) - g_prs[i]) * k;
+        g_act[i] += ((active[i] ? 1.f : 0.f) - g_act[i]) * kAct;
+        g_scale[i].step(g_down[i] ? .90f : 1.f, dt);
+        if (g_ripReq[i].exchange(false)) g_rip[i] = 0.f;
+        if (g_rip[i] >= 0.f) { g_rip[i] += dt / 0.55f; if (g_rip[i] > 1.f) g_rip[i] = -1.f; }
     }
 
-    // ---- simpan state GL milik game ----
-    GLint prog, vao, vp[4], sRGB, dRGB, sA, dA, eRGB, eA;
-    GLboolean cm[4], dm;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &prog);   glGetIntegerv(0x85B5 /*VERTEX_ARRAY_BINDING*/, &vao);
-    glGetIntegerv(GL_VIEWPORT, vp);
-    glGetIntegerv(0x80C9, &sRGB); glGetIntegerv(0x80C8, &dRGB); glGetIntegerv(0x80CB, &sA); glGetIntegerv(0x80CA, &dA);
-    glGetIntegerv(0x8009, &eRGB); glGetIntegerv(0x883D, &eA);
-    glGetBooleanv(GL_COLOR_WRITEMASK, cm); glGetBooleanv(GL_DEPTH_WRITEMASK, &dm);
-    GLboolean eBlend = glIsEnabled(GL_BLEND), eDepth = glIsEnabled(GL_DEPTH_TEST), eCull = glIsEnabled(GL_CULL_FACE),
-              eScis = glIsEnabled(GL_SCISSOR_TEST), eSten = glIsEnabled(GL_STENCIL_TEST);
+    // ---- simpan & atur render state RenderWare ----
+    void* saved[kRsCount]; for (int i = 0; i < kRsCount; ++i) saved[i] = nullptr;
+    auto set = [](int s, intptr_t v) { if (g_gfx.rsSet) g_gfx.rsSet(s, (void*)v); };
+    if (g_gfx.rsGet) for (int i = 0; i < kRsCount; ++i) g_gfx.rsGet(kRsIds[i], &saved[i]);
+    set(rsTEXRASTER, 0); set(rsZTEST, 0); set(rsZWRITE, 0); set(rsSHADE, shadeGOURAUD);
+    set(rsVALPHA, 1); set(rsSRCBLEND, blSRCALPHA); set(rsDESTBLEND, blINVSRCALPHA);
+    g_z = g_gfx.nearScreenZ ? g_gfx.nearScreenZ() : 0.f;
 
-    glViewport(0, 0, W, H);
-    glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
-    glEnable(GL_BLEND);
-    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-
-    glUseProgram(g_prog); glBindVertexArray(g_vao);
-    glUniform2f(uRes, (float)W, (float)H);
-
-    static const float acc[BTN_COUNT][3] = {{1.0f, 0.62f, 0.05f}, {1.0f, 0.30f, 0.12f}, {1.0f, 0.62f, 0.05f}, {0.45f, 0.78f, 1.0f}};
-    static const int   icon[BTN_COUNT]   = {0, 2, 1, 3};
     Layout L = makeLayout(W, H);
+    float tsec = (float)now;
     for (int i = 0; i < BTN_COUNT; ++i) {
-        float scale = 1.0f - 0.07f * g_prs[i];
-        glUniform4f(uRect, L.cx[i], L.cy, L.half, scale);
-        glUniform3f(uAccent, acc[i][0], acc[i][1], acc[i][2]);
-        glUniform1f(uActive, g_act[i]);
-        glUniform1f(uPulse, i == BTN_LIGHTS ? 1.0f : g_pulse);   // tombol lampu menyala tetap, sein berkedip
-        glUniform1f(uPress, g_prs[i]);
-        glUniform1i(uIcon, icon[i]);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        float raw = clamp01(g_appear * 1.36f - i * .12f);
+        g_alphaMul = clamp01(raw * 1.5f);
+        float slide = (1.f - easeOutBack(raw)) * L.half * 2.4f;          // meluncur naik dari bawah
+        drawButton(i, L.cx[i], L.cy + slide, L.half, std::max(.5f, g_scale[i].x), g_act[i],
+                   i == BTN_LIGHTS ? 1.f : g_pulse, tsec, g_rip[i]);
     }
+    g_alphaMul = 1.f;
+    flush();
 
-    // ---- pulihkan state GL ----
-    glBindVertexArray(vao); glUseProgram(prog);
-    glViewport(vp[0], vp[1], vp[2], vp[3]);
-    glBlendFuncSeparate(sRGB, dRGB, sA, dA); glBlendEquationSeparate(eRGB, eA);
-    glColorMask(cm[0], cm[1], cm[2], cm[3]);
-    (void)dm;
-    if (eBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-    if (eDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    if (eCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
-    if (eScis) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
-    if (eSten) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
+    // ---- pulihkan state ----
+    if (g_gfx.rsSet && g_gfx.rsGet) for (int i = 0; i < kRsCount; ++i) g_gfx.rsSet(kRsIds[i], saved[i]);
+    if (g_firstDraw) { g_firstDraw = false; LOGI("Tombol digambar pertama kali: layar %dx%d, z=%.3f", W, H, g_z); }
 }

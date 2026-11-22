@@ -5,7 +5,6 @@
 #include <mod/config.h>
 #include <mod/amlmod.h>
 #include <android/log.h>
-#include <EGL/egl.h>
 #include <atomic>
 #include <math.h>
 #include <stdint.h>
@@ -14,11 +13,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include "ui.h"
+#include "log.h"
 
-MYMODCFG(net.local.improvedvehiclemobile, Improved Vehicle Mobile, 0.1.0, YourName)
+MYMODCFG(net.local.improvedvehiclemobile, Improved Vehicle Mobile, 0.2.0, YourName)
 
 #define TAG "ImprovedVehicleMobile"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGI(...) ImLog(__VA_ARGS__)
 
 // ====================== PERLU DIVERIFIKASI DI GAME ANDA ======================
 // 1) Kode event sentuh pada AND_TouchEvent(type, id, x, y). Nilai asli dicatat di logcat
@@ -40,7 +40,7 @@ static int   (*OS_ScreenGetHeight)() = nullptr;
 static void  (*AddLight)(unsigned char, Vec3, Vec3, float, float, float, float, unsigned char, bool, void*) = nullptr;
 
 static void (*PreRender_o)(void*);
-static void (*MobileRender_o)();
+static void (*Render2d_o)();
 static void (*Touch_o)(int, int, int, int);
 static void (*HeadBeam_o)(void*, int, void*, unsigned char);
 static unsigned char (*HeadEffect_o)(void*, int, void*, unsigned char, unsigned char);
@@ -84,6 +84,8 @@ static bool isPlayerVehicle(void* self) { return FindPlayerVehicle && self && se
 static void PreRender_h(void* self) {
     PreRender_o(self);
     if (!isPlayerVehicle(self)) return;
+    static bool seen = false;
+    if (!seen) { seen = true; LOGI("Kendaraan pemain terdeteksi (PreRender berjalan)"); }
     g_lastPlayerVehMs = nowMs();
 
     int mode = g_mode;
@@ -110,16 +112,18 @@ static unsigned char HeadEffect_h(void* s, int i, void* m, unsigned char a, unsi
 static void HeadFloorTwin_h(void* s, void* m) { if (g_lightsOff && isPlayerVehicle(s)) return; HeadFloorTwin_o(s, m); }
 static void HeadFloorSingle_h(void* s, void* m, unsigned char b) { if (g_lightsOff && isPlayerVehicle(s)) return; HeadFloorSingle_o(s, m, b); }
 
-// ---------------------------- render tombol (thread render) ----------------------------
-static void MobileRender_h() {
-    MobileRender_o();
-    if (!eglGetCurrentContext()) return;
+// ---------------------------- render tombol (thread utama, di Render2dStuff) ----------------------------
+static bool g_uiOk = false;
+static void Render2d_h() {
+    Render2d_o();
     bool vis = nowMs() - g_lastPlayerVehMs < 500;
-    g_visible = vis;
-    if (!vis || !OS_ScreenGetWidth || !OS_ScreenGetHeight) return;
+    g_visible = UiShown();
+    static int logged = 0;
+    if (logged < 3) { ++logged; LOGI("Render2dStuff berjalan: uiOk=%d vis=%d", (int)g_uiOk, (int)vis); }
+    if (!g_uiOk || !OS_ScreenGetWidth || !OS_ScreenGetHeight) return;
     int m = g_mode;
     bool act[BTN_COUNT] = {m == SIG_LEFT, m == SIG_HAZARD, m == SIG_RIGHT, !g_lightsOff};
-    UiDraw(OS_ScreenGetWidth(), OS_ScreenGetHeight(), act, blinkOn());
+    UiDraw(OS_ScreenGetWidth(), OS_ScreenGetHeight(), act, vis);
 }
 
 // ---------------------------- sentuhan (thread UI) ----------------------------
@@ -171,11 +175,19 @@ extern "C" void OnModLoad() {
     LOGI("FindPlayerVehicle=%p ScreenW=%p ScreenH=%p AddLight=%p", FindPlayerVehicle, OS_ScreenGetWidth, OS_ScreenGetHeight, AddLight);
 
     hookSym("_ZN8CVehicle9PreRenderEv", PreRender_h, PreRender_o);
-    hookSym("_ZN12CPostEffects12MobileRenderEv", MobileRender_h, MobileRender_o);
+    hookSym("_Z13Render2dStuffv", Render2d_h, Render2d_o);
+    {
+        UiGfx gfx{};
+        gfx.nearScreenZ     = (float (*)())aml->GetSym(g_gta, "_Z20RwIm2DGetNearScreenZv");
+        gfx.rsSet           = (int (*)(int, void*))aml->GetSym(g_gta, "_Z16RwRenderStateSet13RwRenderStatePv");
+        gfx.rsGet           = (int (*)(int, void*))aml->GetSym(g_gta, "_Z16RwRenderStateGet13RwRenderStatePv");
+        gfx.renderPrimitive = (int (*)(int, void*, int))aml->GetSym(g_gta, "_Z21RwIm2DRenderPrimitive15RwPrimitiveTypeP14RwOpenGLVertexi");
+        g_uiOk = UiInit(gfx);
+    }
     hookSym("_Z14AND_TouchEventiiii", Touch_h, Touch_o);
     hookSym("_ZN8CVehicle15DoHeadLightBeamEiR7CMatrixh", HeadBeam_h, HeadBeam_o);
     hookSym("_ZN8CVehicle17DoHeadLightEffectEiR7CMatrixhh", HeadEffect_h, HeadEffect_o);
     hookSym("_ZN8CVehicle25DoHeadLightReflectionTwinER7CMatrix", HeadFloorTwin_h, HeadFloorTwin_o);
     hookSym("_ZN8CVehicle27DoHeadLightReflectionSingleER7CMatrixh", HeadFloorSingle_h, HeadFloorSingle_o);
-    LOGI("Improved Vehicle Mobile 0.1.0 dimuat");
+    LOGI("Improved Vehicle Mobile 0.2.0 dimuat");
 }
