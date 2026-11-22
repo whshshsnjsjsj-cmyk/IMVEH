@@ -1,3 +1,5 @@
+#include <mod/logger.h>
+#include "main.h" // Tambahkan header utama yang menyimpan namespace ivm
 #pragma once
 #include "common.h"
 
