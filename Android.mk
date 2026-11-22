@@ -4,6 +4,9 @@ include $(CLEAR_VARS)
 
 LOCAL_MODULE := ImprovedVehicleMobile
 
+# Tambahkan baris ini agar NDK membaca semua file .h di folder utama proyek
+LOCAL_C_INCLUDES += $(LOCAL_PATH)
+
 # Otomatis mencari semua file .cpp dan .c di folder saat ini dan 1 folder di bawahnya (seperti src/ atau jni/)
 ALL_CPP_FILES := $(wildcard $(LOCAL_PATH)/*.cpp $(LOCAL_PATH)/*/*.cpp)
 ALL_C_FILES   := $(wildcard $(LOCAL_PATH)/*.c $(LOCAL_PATH)/*/*.c)
