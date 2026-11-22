@@ -6,7 +6,7 @@
 //       dan ringkasan diagnosa di IMVEH.log.
 #include "logger.h"
 #include "config.h"
-#include <mod/amlmod.h>
+#include "amlmod.h"
 #include <android/log.h>
 #include <atomic>
 #include <math.h>
