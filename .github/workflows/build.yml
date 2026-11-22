@@ -29,6 +29,7 @@ jobs:
           echo "Header AML: $hdr"
           mkdir -p include/mod
           cp -r "$(dirname "$hdr")"/. include/mod/
+          if [ ! -f include/mod/config.cpp ]; then echo "config.cpp tidak ada di $(dirname "$hdr")"; ls include/mod; exit 1; fi
 
       - name: Siapkan NDK
         run: |
