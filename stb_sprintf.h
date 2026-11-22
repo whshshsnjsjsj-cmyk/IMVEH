@@ -1,3 +1,5 @@
+#ifndef STB_SPRINTF_H_INCLUDE_GUARD
+#define STB_SPRINTF_H_INCLUDE_GUARD
 // stb_sprintf - v1.10 - public domain snprintf() implementation
 // originally by Jeff Roberts / RAD Game Tools, 2015/10/20
 // http://github.com/nothings/stb
@@ -1904,3 +1906,4 @@ ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ------------------------------------------------------------------------------
 */
+#endif // STB_SPRINTF_H_INCLUDE_GUARD
