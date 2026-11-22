@@ -5,7 +5,7 @@
 // v0.3: perbaikan sentuhan (tombol gas/kamera macet), sein NPC, pembacaan matrix lebih tahan banting,
 //       dan ringkasan diagnosa di IMVEH.log.
 #include "logger.h"
-#include <mod/config.h>
+#include "config.h"
 #include <mod/amlmod.h>
 #include <android/log.h>
 #include <atomic>
