@@ -1,0 +1,5 @@
+# hasil build
+libs/
+obj/
+# header AML diambil otomatis oleh CI (untuk build lokal, salin sendiri)
+include/mod/
